@@ -284,7 +284,7 @@ export class ClientResponseCache {
      * has never read therefore cannot grow this map.
      */
     private readonly _evictionGeneration = new Map<string, number>();
-    // A reset must invalidate pending reads even if the same key is captured again at generation zero.
+    // Connection resets invalidate pending reads and writes, even when per-key generations restart at zero.
     private _connectionGeneration = 0;
     /**
      * `name → Tool` index derived from the cached `tools/list` entry, memoized
@@ -390,10 +390,10 @@ export class ClientResponseCache {
      * probe is issued.
      */
     private async _probe(method: string, params?: string): Promise<CacheEntry | undefined> {
-        const connectionGeneration = this._connectionGeneration;
         const generation = this.captureGeneration(method, params);
         const isCurrent = () =>
-            this._connectionGeneration === connectionGeneration && this._evictionGeneration.get(genKey(method, params)) === generation;
+            this._connectionGeneration === generation.connection &&
+            this._evictionGeneration.get(genKey(method, params)) === generation.eviction;
         const key = { method, params: params ?? '' };
         const ownPartition = this._partitionFor('private');
         const own = await this._store.get({ ...key, partition: ownPartition });
@@ -477,26 +477,27 @@ export class ClientResponseCache {
     }
 
     /**
-     * Snapshot the eviction generation for `{method, params}` before a store
-     * lookup or request (a list walk's page 1, or a `resources/read` for `params`).
+     * Snapshot per-key eviction and connection generations before a store
+     * lookup or request (including a list walk or a resource read).
      * Records the key so an interleaved {@linkcode evictKey} for the same
      * `{method, params}` knows there is an in-flight write to suppress and
      * bumps; without the record, `evictKey`'s recorded-only bump would skip
      * and the stale body would be cached.
      */
-    captureGeneration(method: string, params?: string): number {
+    captureGeneration(method: string, params?: string): { eviction: number; connection: number } {
         const gk = genKey(method, params);
         const current = this._evictionGeneration.get(gk) ?? 0;
         this._evictionGeneration.set(gk, current);
-        return current;
+        return { eviction: current, connection: this._connectionGeneration };
     }
 
     /**
-     * Write `value` under `{method}` unless the per-method generation moved
-     * since `capturedGen` was taken — a `list_changed` that landed mid-walk has
+     * Write `value` under `{method}` only if the per-method and connection
+     * generations still match `capturedGen`. A `list_changed` that landed mid-walk has
      * already invalidated the result the caller is about to write, and
      * overwriting the eviction with the stale aggregate would lose the
-     * invalidation.
+     * invalidation. The connection generation also rejects writes captured
+     * before a reconnect, even if the per-key generation resets to zero.
      *
      * The value is stored as its JSON-serialized document; serialization
      * doubles as the mutation barrier, so a caller mutating the returned
@@ -530,10 +531,14 @@ export class ClientResponseCache {
     async write(
         method: string,
         value: unknown,
-        capturedGen: number,
+        capturedGen: { eviction: number; connection: number },
         freshness?: { expiresAt: number; scope: CacheScope; params?: string }
     ): Promise<void> {
-        if ((this._evictionGeneration.get(genKey(method, freshness?.params)) ?? 0) !== capturedGen) return;
+        if (
+            this._connectionGeneration !== capturedGen.connection ||
+            (this._evictionGeneration.get(genKey(method, freshness?.params)) ?? 0) !== capturedGen.eviction
+        )
+            return;
         const params = freshness?.params ?? '';
         const ownPartition = this._partitionFor('private');
         const sharedPartition = this._partitionFor('public');
