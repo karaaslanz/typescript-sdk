@@ -284,6 +284,8 @@ export class ClientResponseCache {
      * has never read therefore cannot grow this map.
      */
     private readonly _evictionGeneration = new Map<string, number>();
+    // Reject pending writes captured before the most recent reconnect.
+    private _connectionGeneration = 0;
     /**
      * `name → Tool` index derived from the cached `tools/list` entry, memoized
      * against the entry's `stamp` so it re-derives only when the backing entry
@@ -476,11 +478,11 @@ export class ClientResponseCache {
      * bumps; without the record, `evictKey`'s recorded-only bump would skip
      * and the stale body would be cached.
      */
-    captureGeneration(method: string, params?: string): number {
+    captureGeneration(method: string, params?: string): { eviction: number; connection: number } {
         const gk = genKey(method, params);
         const current = this._evictionGeneration.get(gk) ?? 0;
         this._evictionGeneration.set(gk, current);
-        return current;
+        return { eviction: current, connection: this._connectionGeneration };
     }
 
     /**
@@ -522,10 +524,13 @@ export class ClientResponseCache {
     async write(
         method: string,
         value: unknown,
-        capturedGen: number,
+        capturedGen: { eviction: number; connection: number },
         freshness?: { expiresAt: number; scope: CacheScope; params?: string }
     ): Promise<void> {
-        if ((this._evictionGeneration.get(genKey(method, freshness?.params)) ?? 0) !== capturedGen) return;
+        if (
+            this._connectionGeneration !== capturedGen.connection ||
+            (this._evictionGeneration.get(genKey(method, freshness?.params)) ?? 0) !== capturedGen.eviction
+        ) return;
         const params = freshness?.params ?? '';
         const ownPartition = this._partitionFor('private');
         const sharedPartition = this._partitionFor('public');
@@ -591,6 +596,7 @@ export class ClientResponseCache {
      * return is a plain void here and the caller need not await.
      */
     resetForReconnect(): void {
+        this._connectionGeneration++;
         if (!this._isUserSupplied) void this._store.clear();
         this._evictionGeneration.clear();
         this._toolIndex = undefined;

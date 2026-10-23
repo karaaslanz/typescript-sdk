@@ -170,10 +170,10 @@ describe('ClientResponseCache', () => {
         await userCache.write('tools/list', { tools: [TOOL_A] }, userCache.captureGeneration('tools/list'));
         expect((await userCache.toolDefinition('a'))?.name).toBe('a');
         await userCache.evict('prompts/list');
-        expect(userCache.captureGeneration('prompts/list')).toBe(1);
+        expect(userCache.captureGeneration('prompts/list').eviction).toBe(1);
         userCache.resetForReconnect();
         expect(userStore.get({ method: 'tools/list', partition: PRE })).toBeDefined();
-        expect(userCache.captureGeneration('prompts/list')).toBe(0);
+        expect(userCache.captureGeneration('prompts/list').eviction).toBe(0);
         // Index dropped → re-derived from the (still-populated) store on next read.
         expect((userCache as unknown as { _toolIndex?: unknown })._toolIndex).toBeUndefined();
         expect((await userCache.toolDefinition('a'))?.name).toBe('a');
@@ -1106,13 +1106,13 @@ describe('Client honours cacheHints (SEP-2549)', () => {
         // A URI the client HAS read is recorded by captureGeneration; an
         // `updated` for it bumps (the in-flight guard still works).
         await client.readResource({ uri: 'res://hot' });
-        expect(cacheOf(client).captureGeneration('resources/read', 'res://hot')).toBe(0);
+        expect(cacheOf(client).captureGeneration('resources/read', 'res://hot').eviction).toBe(0);
         await serverTx.send({
             jsonrpc: '2.0',
             method: 'notifications/resources/updated',
             params: { uri: 'res://hot' }
         } as JSONRPCMessage);
-        expect(cacheOf(client).captureGeneration('resources/read', 'res://hot')).toBe(1);
+        expect(cacheOf(client).captureGeneration('resources/read', 'res://hot').eviction).toBe(1);
         expect(gen.size).toBe(1);
     });
 
@@ -1335,5 +1335,44 @@ describe('Client honours cacheHints (SEP-2549)', () => {
         expect(tools.map(t => t.name)).toEqual(['a']);
         expect(listCount()).toBe(1);
         expect(errors.map(e => e.message)).toContain('redis down');
+    });
+});
+
+describe('stale cache writes across reconnect (#3075)', () => {
+    const cases = (['private', 'public'] as const).flatMap(scope =>
+        [false, true].flatMap(changeServer =>
+            [false, true].map(writeFreshFirst => ({ scope, changeServer, writeFreshFirst }))
+        )
+    );
+
+    it.each(cases)(
+        '$scope stale write is rejected (changeServer=$changeServer, writeFreshFirst=$writeFreshFirst)',
+        async ({ scope, changeServer, writeFreshFirst }) => {
+            const store = new InMemoryResponseCacheStore();
+            const cache = new ClientResponseCache(store, true, undefined, 'alice');
+            const freshness = { expiresAt: Date.now() + 60_000, scope };
+            cache.setServerIdentity('server-a');
+            const oldGeneration = cache.captureGeneration('tools/list');
+            cache.resetForReconnect();
+            cache.setServerIdentity(changeServer ? 'server-b' : 'server-a');
+            const newGeneration = cache.captureGeneration('tools/list');
+            if (writeFreshFirst) {
+                await cache.write('tools/list', { tools: [TOOL_B] }, newGeneration, freshness);
+            }
+            await cache.write('tools/list', { tools: [TOOL_A] }, oldGeneration, freshness);
+            expect((await cache.read('tools/list'))?.value).toEqual(
+                writeFreshFirst ? { tools: [TOOL_B] } : undefined
+            );
+        }
+    );
+
+    it('a fresh post-reconnect read can still reuse a retained user-supplied cache entry', async () => {
+        const cache = new ClientResponseCache(new InMemoryResponseCacheStore(), true, undefined, 'alice');
+        const freshness = { expiresAt: Date.now() + 60_000, scope: 'private' as const };
+        cache.setServerIdentity('server-a');
+        await cache.write('tools/list', { tools: [TOOL_A] }, cache.captureGeneration('tools/list'), freshness);
+        cache.resetForReconnect();
+        cache.setServerIdentity('server-a');
+        expect((await cache.read('tools/list'))?.value).toEqual({ tools: [TOOL_A] });
     });
 });
